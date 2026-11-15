@@ -1,0 +1,641 @@
+name: Build APK
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Create project files
+        run: |
+          mkdir -p FluxMovies && cd FluxMovies
+          cat > .gitignore <<'FM_EOF'
+          .gradle/
+          build/
+          local.properties
+          .idea/
+          *.iml
+          FM_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FM_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.fluxmovies.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.fluxmovies.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+
+          dependencies {
+              val bom = platform("androidx.compose:compose-bom:2024.09.00")
+              implementation(bom)
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.media3:media3-exoplayer:1.4.1")
+              implementation("androidx.media3:media3-ui:1.4.1")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("io.coil-kt:coil-compose:2.7.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          FM_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.FluxMovies">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FM_EOF
+          mkdir -p app/src/main/java/com/fluxmovies/app
+          cat > app/src/main/java/com/fluxmovies/app/Api.kt <<'FM_EOF'
+          package com.fluxmovies.app
+
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import org.json.JSONObject
+          import java.net.URLEncoder
+
+          data class Movie(val id: String, val title: String, val year: String, val lang: String) {
+              val thumb get() = "https://archive.org/services/img/$id"
+          }
+
+          data class VFile(val label: String, val url: String, val name: String, val sizeMb: Long)
+          data class Sub(val url: String, val name: String)
+
+          object Api {
+              private val client = OkHttpClient()
+              private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+              private fun get(url: String): String =
+                  client.newCall(Request.Builder().url(url).build()).execute().use { r ->
+                      if (!r.isSuccessful) error("HTTP ${r.code}")
+                      r.body!!.string()
+                  }
+
+              /** Internet Archive "feature_films" collection: public domain / freely distributable films. */
+              fun search(query: String, lang: String, page: Int): List<Movie> {
+                  var q = "collection:(feature_films) AND mediatype:(movies)"
+                  if (query.isNotBlank()) q += " AND title:(${query.trim().replace("\"", "")}*)"
+                  if (lang.isNotBlank()) q += " AND language:($lang)"
+                  val url = "https://archive.org/advancedsearch.php?q=${enc(q)}" +
+                      "&fl[]=identifier&fl[]=title&fl[]=year&fl[]=language" +
+                      "&sort[]=${enc("downloads desc")}&rows=30&page=$page&output=json"
+                  val docs = JSONObject(get(url)).getJSONObject("response").getJSONArray("docs")
+                  return (0 until docs.length()).map {
+                      val d = docs.getJSONObject(it)
+                      Movie(
+                          d.getString("identifier"),
+                          d.optString("title", d.getString("identifier")),
+                          d.optString("year", ""),
+                          d.optString("language", "")
+                      )
+                  }
+              }
+
+              fun files(id: String): Pair<List<VFile>, List<Sub>> {
+                  val arr = JSONObject(get("https://archive.org/metadata/$id")).optJSONArray("files")
+                      ?: return emptyList<VFile>() to emptyList()
+                  val videos = mutableListOf<VFile>()
+                  val subs = mutableListOf<Sub>()
+                  for (i in 0 until arr.length()) {
+                      val f = arr.getJSONObject(i)
+                      val name = f.getString("name")
+                      val lower = name.lowercase()
+                      val url = "https://archive.org/download/$id/" + name.split("/").joinToString("/") { enc(it).replace("+", "%20") }
+                      val mb = f.optString("size", "0").toLongOrNull()?.div(1024 * 1024) ?: 0
+                      when {
+                          lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".ogv") || lower.endsWith(".mkv") -> {
+                              val fmt = f.optString("format", lower.substringAfterLast('.'))
+                              videos += VFile("$fmt • ${mb}MB", url, name, mb)
+                          }
+                          lower.endsWith(".vtt") || lower.endsWith(".srt") -> subs += Sub(url, name)
+                      }
+                  }
+                  // Prefer mp4 (ExoPlayer-friendly), biggest first = highest quality first
+                  val sorted = videos.sortedWith(compareByDescending<VFile> { it.name.lowercase().endsWith(".mp4") }.thenByDescending { it.sizeMb })
+                  return sorted to subs
+              }
+          }
+          FM_EOF
+          mkdir -p app/src/main/java/com/fluxmovies/app
+          cat > app/src/main/java/com/fluxmovies/app/Glass.kt <<'FM_EOF'
+          package com.fluxmovies.app
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.rounded.Download
+          import androidx.compose.material.icons.rounded.Movie
+          import androidx.compose.material.icons.rounded.Search
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.drawBehind
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Shape
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          /** iOS-style "liquid glass": translucent fill + soft highlight + specular edge. */
+          fun Modifier.glass(shape: Shape = RoundedCornerShape(22.dp), base: Float = 0f): Modifier = this
+              .clip(shape)
+              .background(Color(0xFF14141C).copy(alpha = base))
+              .background(Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.20f), Color.White.copy(alpha = 0.06f))))
+              .border(
+                  1.dp,
+                  Brush.linearGradient(listOf(Color.White.copy(alpha = 0.60f), Color.White.copy(alpha = 0.06f), Color.White.copy(alpha = 0.28f))),
+                  shape
+              )
+
+          @Composable
+          fun FluxBackground(content: @Composable BoxScope.() -> Unit) {
+              Box(
+                  Modifier.fillMaxSize().background(Color(0xFF07070C)).drawBehind {
+                      drawRect(Brush.radialGradient(listOf(Color(0x773A7BFF), Color.Transparent), center = Offset(size.width * 0.10f, size.height * 0.08f), radius = size.width * 0.95f))
+                      drawRect(Brush.radialGradient(listOf(Color(0x66B04DFF), Color.Transparent), center = Offset(size.width * 0.95f, size.height * 0.45f), radius = size.width * 1.0f))
+                      drawRect(Brush.radialGradient(listOf(Color(0x5500D1B2), Color.Transparent), center = Offset(size.width * 0.20f, size.height * 0.95f), radius = size.width * 0.95f))
+                  },
+                  content = content
+              )
+          }
+
+          @Composable
+          fun GlassCircleButton(icon: ImageVector, desc: String, onClick: () -> Unit) {
+              Box(
+                  Modifier.size(42.dp).glass(CircleShape, 0.35f).clickable(onClick = onClick),
+                  contentAlignment = Alignment.Center
+              ) { Icon(icon, desc, tint = Color.White) }
+          }
+
+          @Composable
+          fun GlassSearch(value: String, onChange: (String) -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().glass(RoundedCornerShape(20.dp), 0.30f).padding(horizontal = 14.dp, vertical = 13.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Icon(Icons.Rounded.Search, null, tint = Color.White.copy(alpha = 0.7f))
+                  Spacer(Modifier.width(10.dp))
+                  Box(Modifier.weight(1f)) {
+                      if (value.isEmpty()) Text("Search movies", color = Color.White.copy(alpha = 0.5f), fontSize = 16.sp)
+                      BasicTextField(
+                          value = value,
+                          onValueChange = onChange,
+                          singleLine = true,
+                          textStyle = TextStyle(color = Color.White, fontSize = 16.sp),
+                          cursorBrush = SolidColor(Color.White),
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun GlassChip(label: String, selected: Boolean, onClick: () -> Unit) {
+              val shape = RoundedCornerShape(50)
+              Box(
+                  Modifier
+                      .clip(shape)
+                      .background(if (selected) Color.White.copy(alpha = 0.30f) else Color.White.copy(alpha = 0.08f))
+                      .border(1.dp, Color.White.copy(alpha = if (selected) 0.55f else 0.18f), shape)
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = 16.dp, vertical = 8.dp)
+              ) {
+                  Text(label, color = Color.White, fontSize = 14.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+              }
+          }
+
+          @Composable
+          fun FloatingNav(tab: Int, onTab: (Int) -> Unit, modifier: Modifier = Modifier) {
+              Row(
+                  modifier
+                      .navigationBarsPadding()
+                      .padding(bottom = 14.dp)
+                      .glass(RoundedCornerShape(34.dp), 0.55f)
+                      .padding(6.dp),
+                  horizontalArrangement = Arrangement.spacedBy(4.dp)
+              ) {
+                  NavItem(Icons.Rounded.Movie, "Movies", tab == 0) { onTab(0) }
+                  NavItem(Icons.Rounded.Download, "Downloads", tab == 1) { onTab(1) }
+              }
+          }
+
+          @Composable
+          private fun NavItem(icon: ImageVector, label: String, selected: Boolean, onClick: () -> Unit) {
+              val shape = RoundedCornerShape(28.dp)
+              Row(
+                  Modifier
+                      .clip(shape)
+                      .background(if (selected) Color.White.copy(alpha = 0.22f) else Color.Transparent)
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = 20.dp, vertical = 12.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                  Icon(icon, label, tint = if (selected) Color.White else Color.White.copy(alpha = 0.6f))
+                  Text(label, color = if (selected) Color.White else Color.White.copy(alpha = 0.6f), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+              }
+          }
+          FM_EOF
+          mkdir -p app/src/main/java/com/fluxmovies/app
+          cat > app/src/main/java/com/fluxmovies/app/MainActivity.kt <<'FM_EOF'
+          package com.fluxmovies.app
+
+          import android.app.DownloadManager
+          import android.content.Context
+          import android.net.Uri
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.itemsIndexed
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.rounded.ArrowBackIosNew
+          import androidx.compose.material.icons.rounded.CheckCircle
+          import androidx.compose.material.icons.rounded.Delete
+          import androidx.compose.material.icons.rounded.Download
+          import androidx.compose.material.icons.rounded.PlayArrow
+          import androidx.compose.material.icons.rounded.RadioButtonUnchecked
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MimeTypes
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.ui.PlayerView
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                  )
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(color = Color.Transparent, contentColor = Color.White) { App() }
+                      }
+                  }
+              }
+          }
+
+          private val LANGS = listOf(
+              "All" to "", "English" to "english", "Hindi" to "hindi", "Spanish" to "spanish",
+              "French" to "french", "German" to "german", "Italian" to "italian",
+              "Russian" to "russian", "Japanese" to "japanese", "Chinese" to "chinese",
+              "Arabic" to "arabic", "Portuguese" to "portuguese"
+          )
+
+          @Composable
+          fun App() {
+              var tab by remember { mutableIntStateOf(0) }
+              var playing by remember { mutableStateOf<Movie?>(null) }
+              var offline by remember { mutableStateOf<File?>(null) }
+
+              FluxBackground {
+                  when {
+                      playing != null -> {
+                          BackHandler { playing = null }
+                          PlayerScreen(playing!!.title, playing!!.id, null) { playing = null }
+                      }
+                      offline != null -> {
+                          BackHandler { offline = null }
+                          PlayerScreen(offline!!.nameWithoutExtension, null, offline) { offline = null }
+                      }
+                      else -> {
+                          if (tab == 0) BrowseScreen { playing = it } else DownloadsScreen { offline = it }
+                          FloatingNav(tab, { tab = it }, Modifier.align(Alignment.BottomCenter))
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun BrowseScreen(onOpen: (Movie) -> Unit) {
+              var query by remember { mutableStateOf("") }
+              var lang by remember { mutableStateOf("") }
+              var movies by remember { mutableStateOf<List<Movie>>(emptyList()) }
+              var page by remember { mutableIntStateOf(1) }
+              var loading by remember { mutableStateOf(false) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var endReached by remember { mutableStateOf(false) }
+
+              LaunchedEffect(query, lang, page) {
+                  loading = true; error = null
+                  try {
+                      val r = withContext(Dispatchers.IO) { Api.search(query, lang, page) }
+                      movies = if (page == 1) r else movies + r
+                      endReached = r.size < 30
+                  } catch (e: Exception) { error = e.message ?: "Network error" }
+                  loading = false
+              }
+
+              Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                  Text(
+                      "Flux Movies",
+                      modifier = Modifier.padding(start = 20.dp, top = 14.dp, end = 20.dp, bottom = 10.dp),
+                      fontSize = 34.sp, fontWeight = FontWeight.Bold
+                  )
+                  Box(Modifier.padding(horizontal = 16.dp)) {
+                      GlassSearch(query) { query = it; page = 1 }
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(LANGS) { (label, code) ->
+                          GlassChip(label, lang == code) { lang = code; page = 1 }
+                      }
+                  }
+                  error?.let { Text("⚠ $it", Modifier.padding(16.dp), color = Color(0xFFFF6B6B)) }
+                  if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp), color = Color.White, trackColor = Color.Transparent)
+                  LazyVerticalGrid(
+                      columns = GridCells.Adaptive(140.dp),
+                      contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 120.dp),
+                      horizontalArrangement = Arrangement.spacedBy(12.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp),
+                      modifier = Modifier.weight(1f)
+                  ) {
+                      itemsIndexed(movies) { i, m ->
+                          if (i == movies.lastIndex && !loading && !endReached) LaunchedEffect(m.id) { page++ }
+                          val shape = RoundedCornerShape(22.dp)
+                          Box(
+                              Modifier.fillMaxWidth().aspectRatio(2f / 3f).glass(shape).clickable { onOpen(m) }
+                          ) {
+                              AsyncImage(m.thumb, m.title, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                              Box(
+                                  Modifier.fillMaxWidth().align(Alignment.BottomCenter)
+                                      .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))))
+                                      .padding(start = 10.dp, end = 10.dp, top = 28.dp, bottom = 10.dp)
+                              ) {
+                                  Column {
+                                      Text(m.title, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                      if (m.year.isNotBlank()) Text(m.year, fontSize = 11.sp, color = Color.White.copy(alpha = 0.7f))
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun DownloadsScreen(onOpen: (File) -> Unit) {
+              val ctx = LocalContext.current
+              var files by remember { mutableStateOf(listOf<File>()) }
+              LaunchedEffect(Unit) {
+                  files = ctx.getExternalFilesDir("Movies")?.listFiles()?.filter { it.length() > 0 }?.sortedByDescending { it.lastModified() } ?: emptyList()
+              }
+              Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                  Text(
+                      "Downloads",
+                      modifier = Modifier.padding(start = 20.dp, top = 14.dp, end = 20.dp, bottom = 10.dp),
+                      fontSize = 34.sp, fontWeight = FontWeight.Bold
+                  )
+                  if (files.isEmpty()) Text("No downloads yet.", Modifier.padding(20.dp), color = Color.White.copy(alpha = 0.7f))
+                  LazyColumn(
+                      contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 120.dp),
+                      verticalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
+                      items(files) { f ->
+                          Row(
+                              Modifier.fillMaxWidth().glass(RoundedCornerShape(22.dp), 0.25f).clickable { onOpen(f) }.padding(14.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Icon(Icons.Rounded.PlayArrow, null)
+                              Spacer(Modifier.width(12.dp))
+                              Column(Modifier.weight(1f)) {
+                                  Text(f.nameWithoutExtension, maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                                  Text("${f.length() / 1024 / 1024} MB", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f))
+                              }
+                              IconButton({ f.delete(); files = files - f }) { Icon(Icons.Rounded.Delete, "Delete") }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun PlayerScreen(title: String, id: String?, localFile: File?, onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val prefs = remember { ctx.getSharedPreferences("resume", Context.MODE_PRIVATE) }
+              val player = remember { ExoPlayer.Builder(ctx).build() }
+              var files by remember { mutableStateOf<List<VFile>>(emptyList()) }
+              var subs by remember { mutableStateOf<List<Sub>>(emptyList()) }
+              var selected by remember { mutableStateOf<VFile?>(null) }
+              var error by remember { mutableStateOf<String?>(null) }
+
+              fun play(url: String, key: String, withSubs: Boolean, startAt: Long? = null) {
+                  val b = MediaItem.Builder().setUri(url)
+                  if (withSubs) b.setSubtitleConfigurations(subs.map {
+                      MediaItem.SubtitleConfiguration.Builder(Uri.parse(it.url))
+                          .setMimeType(if (it.name.endsWith(".srt", true)) MimeTypes.APPLICATION_SUBRIP else MimeTypes.TEXT_VTT)
+                          .setLabel(it.name.substringBeforeLast('.'))
+                          .build()
+                  })
+                  player.setMediaItem(b.build(), startAt ?: prefs.getLong(key, 0L))
+                  player.prepare(); player.playWhenReady = true
+              }
+
+              LaunchedEffect(id, localFile) {
+                  if (localFile != null) {
+                      play(Uri.fromFile(localFile).toString(), localFile.name, false)
+                  } else if (id != null) {
+                      try {
+                          val (v, s) = withContext(Dispatchers.IO) { Api.files(id) }
+                          files = v; subs = s
+                          if (v.isEmpty()) error = "No playable file found for this movie"
+                          else { selected = v.first(); play(v.first().url, id + v.first().name, true) }
+                      } catch (e: Exception) { error = e.message }
+                  }
+              }
+
+              DisposableEffect(Unit) {
+                  onDispose {
+                      val key = if (localFile != null) localFile.name else (id ?: "") + (selected?.name ?: "")
+                      if (player.duration > 0 && player.currentPosition < player.duration - 10_000) prefs.edit().putLong(key, player.currentPosition).apply()
+                      player.release()
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                  Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                      GlassCircleButton(Icons.Rounded.ArrowBackIosNew, "Back", onBack)
+                      Spacer(Modifier.width(12.dp))
+                      Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                  }
+                  AndroidView(
+                      factory = { PlayerView(it).apply { this.player = player; useController = true } },
+                      modifier = Modifier.padding(horizontal = 16.dp).fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(24.dp))
+                  )
+                  error?.let { Text("⚠ $it", Modifier.padding(16.dp), color = Color(0xFFFF6B6B)) }
+                  if (files.isNotEmpty()) {
+                      Text("Quality / version", Modifier.padding(start = 20.dp, top = 18.dp, bottom = 8.dp), fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                      LazyColumn(
+                          contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                          verticalArrangement = Arrangement.spacedBy(10.dp),
+                          modifier = Modifier.navigationBarsPadding()
+                      ) {
+                          items(files) { f ->
+                              Row(
+                                  Modifier.fillMaxWidth().glass(RoundedCornerShape(20.dp), 0.25f).clickable {
+                                      val pos = player.currentPosition
+                                      selected = f; play(f.url, id + f.name, true, pos)
+                                  }.padding(start = 14.dp, top = 4.dp, bottom = 4.dp, end = 4.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Icon(if (selected == f) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked, null)
+                                  Spacer(Modifier.width(12.dp))
+                                  Text(f.label, Modifier.weight(1f), fontSize = 14.sp)
+                                  IconButton({
+                                      val safe = (title + "_" + f.name.substringAfterLast('/')).replace(Regex("[^A-Za-z0-9._ -]"), "_")
+                                      val req = DownloadManager.Request(Uri.parse(f.url))
+                                          .setTitle(title)
+                                          .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                          .setDestinationInExternalFilesDir(ctx, "Movies", safe)
+                                      (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+                                      Toast.makeText(ctx, "Download started", Toast.LENGTH_SHORT).show()
+                                  }) { Icon(Icons.Rounded.Download, "Download") }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          FM_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'FM_EOF'
+          <resources>
+              <string name="app_name">Flux Movies</string>
+          </resources>
+          FM_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'FM_EOF'
+          <resources>
+              <style name="Theme.FluxMovies" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#07070C</item>
+              </style>
+          </resources>
+          FM_EOF
+          cat > build.gradle.kts <<'FM_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          FM_EOF
+          cat > gradle.properties <<'FM_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          FM_EOF
+          cat > settings.gradle.kts <<'FM_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FluxMovies"
+          include(":app")
+          FM_EOF
+      - name: Build debug APK
+        working-directory: FluxMovies
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FluxMovies-debug
+          path: FluxMovies/app/build/outputs/apk/debug/*.apk
